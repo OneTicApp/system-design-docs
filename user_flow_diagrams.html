@@ -1,0 +1,1196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trans-Public Bank - User Flow Diagrams</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 30px;
+        }
+        h1 {
+            color: #2c3e50;
+            border-bottom: 2px solid #eee;
+            padding-bottom: 10px;
+        }
+        h2 {
+            color: #34495e;
+            margin-top: 30px;
+            border-left: 4px solid #3498db;
+            padding-left: 10px;
+        }
+        .diagram-container {
+            margin: 20px 0;
+            overflow-x: auto;
+        }
+        .meta-info {
+            font-size: 0.9em;
+            color: #666;
+            background: #f8f9fa;
+            padding: 10px;
+            border-radius: 4px;
+            margin-bottom: 15px;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <h1>Trans-Public Bank User Flows</h1>
+        <p>Generated on: 2026-02-13</p>
+        <p>This document contains the sequence diagrams for the core user flows: Registration (KYC), Login, and Deposit (Add Cash).</p>
+    </div>
+
+    <!-- 1. Registration Flow -->
+    <div class="container">
+        <h2>1. Registration & KYC Flow</h2>
+        <div class="meta-info">
+            <strong>Source:</strong> module_kyc_analysis.md<br>
+            <strong>Description:</strong> Complete onboarding process from phone verification to risk control and account creation.
+        </div>
+        <div class="mermaid">
+sequenceDiagram
+    actor U as 用户
+    participant F as Frontend
+    participant AAC as FTISP-AAC<br/>(统一入口)
+    participant UAM as FTISP-UAM<br/>(认证/用户域)
+    participant MSG as FTISP-MSG<br/>(消息中心)
+    participant DAL as FTISP-DAL<br/>(编排中心)
+    participant KYC as FTISP-KYC<br/>(验证服务)
+    participant RC as 风控系统
+    participant ECIF as FTISP-ECIF<br/>(ECIF中心)
+    participant BANK as 外部银行服务
+    participant ACS as FTISP-ACS<br/>(账户核心)
+    participant DB as TiDB
+    participant OSS as OSS存储
+
+    Note over U,AAC: 第一阶段：注册成为基础用户
+
+    U->>F: 输入手机号
+    F->>AAC: POST /api/v1/auth/send-otp
+    AAC->>UAM: 路由请求
+
+    Note over UAM,Redis: 检查冷却时间（防刷）
+    UAM->>Redis: GET cooldown:otp:phone:REGISTER
+
+    alt 冷却中（60秒内）
+        UAM-->>AAC: 429 Too Many Requests
+        AAC-->>F: 请等待X秒后再试
+    else 可以发送
+        Note over UAM: UAM生成OTP (Redis+DB双写)
+        UAM->>UAM: 生成6位随机码
+        UAM->>Redis: SET otp:phone:REGISTER {otp} TTL=60s
+        UAM->>Redis: SET cooldown:otp:phone:REGISTER "1" TTL=60s
+        UAM->>DB: INSERT t_otp_records(phone, otp_plain, status=PENDING)
+        UAM->>DB: UPDATE旧PENDING记录→EXPIRED (避免多条记录)
+        UAM->>MSG: 发送短信 (异步)
+        MSG->>U: 发送短信 (第三方网关)
+        UAM-->>AAC: 200 OK
+        AAC-->>F: 验证码已发送
+    end
+
+    U->>F: 输入OTP
+    F->>AAC: POST /api/v1/auth/verify-otp
+    AAC->>UAM: 验证OTP (先Redis后DB)
+
+    Note over UAM,Redis: 获取分布式锁（防并发）
+    UAM->>Redis: SET lock:otp:phone:REGISTER "1" NX TTL=5s
+
+    alt 获取锁失败（并发请求）
+        UAM-->>AAC: 429 Too Many Requests
+        AAC-->>F: 请求过于频繁，请稍后重试
+    else 获取锁成功
+        Note over UAM: 验证OTP：先Redis后DB
+        UAM->>Redis: GET otp:phone:REGISTER
+
+        alt Redis命中（正常路径）
+            Note over UAM,Redis: 验证OTP
+            alt OTP正确
+                Note over UAM: 验证成功：删除Redis + 原子更新DB
+                UAM->>Redis: DELETE otp:phone:REGISTER
+                UAM->>DB: UPDATE t_otp_records SET status='USED'<br/>WHERE phone=? AND otp_plain=?<br/>AND status='PENDING'<br/>(原子更新，防止并发)
+                UAM->>Redis: DELETE lock:otp:phone:REGISTER
+
+                Note over UAM: UAM创建用户
+                UAM->>DB: INSERT t_users<br/>(phone, user_type=NEW)
+                UAM->>DB: INSERT t_user_sessions
+                AAC-->>F: 200 OK + token + session_id
+            else OTP错误
+                UAM->>Redis: DELETE lock:otp:phone:REGISTER
+                AAC-->>F: 401 Invalid OTP
+            end
+        else Redis未命中（降级路径）
+            Note over UAM: 降级查询DB
+            UAM->>DB: SELECT * FROM t_otp_records<br/>WHERE phone=? AND otp_type='REGISTER'<br/>AND status='PENDING' AND expires_at>NOW()<br/>ORDER BY created_at DESC LIMIT 1
+
+            alt DB找到有效OTP
+                Note over UAM: 验证成功：原子更新record对象
+                alt OTP正确
+                    UAM->>DB: UPDATE t_otp_records SET status='USED'<br/>WHERE id=? AND status='PENDING'<br/>(原子更新，防止并发)
+                    UAM->>Redis: DELETE lock:otp:phone:REGISTER
+                    UAM->>Redis: DELETE otp:phone:REGISTER (清理残留)
+                    UAM->>DB: INSERT t_users<br/>(phone, user_type=NEW)
+                    UAM->>DB: INSERT t_user_sessions
+                    AAC-->>F: 200 OK + token + session_id
+                else OTP错误
+                    UAM->>Redis: DELETE lock:otp:phone:REGISTER
+                    AAC-->>F: 401 Invalid OTP
+                end
+            else DB无有效OTP
+                UAM->>Redis: DELETE lock:otp:phone:REGISTER
+                AAC-->>F: 401 Invalid OTP
+            end
+        end
+    end
+
+    Note over U,F: 第二阶段：身份证扫描 (纯前端操作)
+
+    U->>F: 扫描/选择身份证正面
+    F->>F: 暂存frontImage
+    U->>F: 扫描/选择身份证反面
+    F->>F: 暂存backImage
+    U->>F: 点击Continue按钮
+
+    Note over U,DAL: 第三阶段：KYC信息收集 (DAL编排)
+
+    F->>AAC: POST /api/v1/kyc/upload-documents
+    AAC->>DAL: 路由到编排中心
+
+    Note over DAL: 创建流程实例
+    DAL->>DB: INSERT t_process_instances
+
+    DAL->>KYC: 调用OCR服务
+    KYC->>OSS: 上传图片
+    KYC->>KYC: OCR识别
+    KYC->>DB: INSERT t_kyc_documents
+    KYC-->>DAL: 返回OCR结果
+    DAL-->>F: 返回OCR数据
+
+    Note over U,F: 用户确认并提交
+
+    U->>F: 确认信息+勾选授权
+    F->>AAC: POST /api/v1/kyc/submit-profile
+    AAC->>DAL: 路由到编排中心
+
+    Note over DAL: 编排：保存用户资料
+    DAL->>UAM: 保存用户资料
+    UAM->>DB: INSERT t_user_profiles
+
+    Note over DAL: 编排：保存授权记录
+    DAL->>UAM: 保存授权记录
+    UAM->>DB: INSERT t_user_consents
+
+    Note over DAL: 编排：调用NIDA验证
+    DAL->>KYC: NIDA验证服务
+    KYC->>KYC: 调用第三方NIDA核查
+    KYC->>DB: INSERT t_verification_logs
+    KYC-->>DAL: 返回验证结果
+
+    alt NIDA验证通过
+        DAL->>UAM: 更新KYC状态(VERIFIED)
+        DAL->>RC: 提交风控审核
+        DAL-->>AAC: 提交成功，等待审核
+    end
+
+    Note over U,F: 第四阶段：可选设置PIN
+
+    U->>F: 设置PIN (可选)
+    F->>AAC: POST /api/v1/auth/set-pin
+    AAC->>UAM: 设置PIN
+    AAC-->>F: PIN设置成功
+
+    Note over U,DB: 第五阶段：风控异步回调 (DAL编排)
+
+    RC->>DAL: 风控回调
+    
+    alt 风控通过
+        Note over DAL: 编排：创建ECIF客户
+        DAL->>ECIF: POST /api/v1/ecif/createCustomer<br/>{userId, personalName, idNumber, phone, bankCode}
+        ECIF->>ECIF: 检查是否老客户 (SELECT FROM t_ecif_customers WHERE user_id=?)
+        ECIF->>ECIF: BankClientFactory.getClient(bankCode)
+        ECIF->>BANK: BankClient.createCustomer() (HTTP API)
+        BANK-->>ECIF: {bankEcifNo, bankAccountNo, resultMark, success}
+        ECIF->>ECIF: INSERT INTO t_ecif_customers (如果新客户)
+        ECIF->>ECIF: INSERT INTO t_ecif_bank_mappings (userId, bankCode, bankEcifNo)
+        ECIF-->>DAL: {platformEcifId, bankEcifNo, isOldEcif, customer}
+
+        Note over DAL: 编排：更新用户信息
+        DAL->>UAM: 更新ECIF ID和用户类型
+        UAM->>DB: UPDATE t_users<br/>(user_type=TYPE_A/B/C)
+
+        Note over DAL: 编排：开户
+        DAL->>ACS: 开立存款户/贷款户
+        Note over DAL: 完成流程实例
+        DAL->>DB: UPDATE t_process_instances<br/>SET status=COMPLETED
+
+        DAL->>MSG: 请求发送开户成功通知
+        MSG->>U: 发送短信/App推送
+    else 风控拒绝
+        DAL->>UAM: 更新KYC状态(REJECTED)
+        DAL->>MSG: 请求发送拒绝通知
+        MSG->>U: 发送短信/App推送
+    end
+        </div>
+    </div>
+
+    <!-- 2. Login Flow -->
+    <div class="container">
+        <h2>2. Login Flow (Phone + PIN)</h2>
+        <div class="meta-info">
+            <strong>Source:</strong> module_login_analysis.md<br>
+            <strong>Description:</strong> Standard login flow with PIN verification and account locking mechanism.
+        </div>
+        <div class="mermaid">
+sequenceDiagram
+    actor U as 用户
+    participant F as Frontend
+    participant A as FTISP-AAC (鉴权中心)
+    participant M as FTISP-UAM (用户认证)
+    participant R as Redis
+    participant D as TiDB
+
+    U->>F: 输入手机号+6位PIN
+    F->>A: POST /api/v1/auth/login
+    A->>A: 验证请求格式
+
+    A->>M: POST /internal/auth/validate
+    M->>R: GET pin:error:{phone}:{date}
+    R-->>M: 返回错误计数
+
+    alt error_count >= 3
+        M->>M: 检查锁定时间
+        alt 仍在锁定期
+            M-->>A: 423 Locked
+            A-->>F: 账户锁定提示
+        else
+            M->>M: 重置计数器
+            M-->>A: 401 Wrong credentials
+            A-->>F: PIN错误提示
+        end
+    else error_count < 3
+        M->>D: SELECT * FROM t_users WHERE phone=?
+
+        alt 用户不存在
+            D-->>M: null
+            M-->>A: 401 Wrong credentials
+            A-->>F: 用户不存在提示
+        else 用户存在
+            D-->>M: UserProfile
+            M->>M: 验证PIN (BCrypt.checkpw)
+
+            alt PIN正确
+                M->>D: UPDATE error_count=0
+                M->>D: INSERT INTO t_user_sessions
+                M-->>A: 验证成功+用户信息
+
+                A->>A: 生成JWT (exp=1h)
+                A-->>F: 200 OK + Token + UserProfile
+                F->>F: 保存Token，跳转首页
+            else PIN错误
+                M->>R: INCR pin:error:{phone}:{date}
+                M->>R: SETEX pin:locked:{phone} 86400
+                M-->>A: 401 Wrong credentials
+                A-->>F: PIN错误提示(剩余次数)
+            end
+        end
+    end
+        </div>
+    </div>
+
+    <!-- 3. Deposit Flow -->
+    <div class="container">
+        <h2>3. Deposit Flow (Mobile Money)</h2>
+        <div class="meta-info">
+            <strong>Source:</strong> module_savings_analysis.md<br>
+            <strong>Description:</strong> Add cash via Mobile Money (STK Push) including App PIN verification.
+        </div>
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    actor User as 用户
+    participant App as 前端 App
+    participant AAC as 鉴权中心 (AAC)
+    participant UAM as 用户中心 (UAM)
+    participant DAL as 聚合层 (DAL)
+    participant CTS as 交易系统 (CTS)
+    participant PG as 支付网关 (Mock)
+    participant ACS as 账户系统 (ACS)
+
+    Note over User, App: 1. 发起充值请求
+    User->>App: 选择 M-Pesa，输入金额 50,000 TZS
+    App->>User: 弹出 "Enter App PIN" / 指纹验证
+    User->>App: 输入 App PIN (例如: 1234)
+
+    Note over App, UAM: 2. App PIN 预校验 (Transaction Auth)
+    App->>AAC: POST /api/v1/auth/verify-pin <br/>{ "pin": "1234" }
+    AAC->>UAM: RPC: validatePin(userId, pin)
+    UAM->>UAM: BCrypt 校验 & 错误计数检查
+    alt PIN 错误
+        UAM-->>AAC: 401 Unauthorized (剩余次数: 2)
+        AAC-->>App: 提示 "PIN 错误，还剩 2 次机会"
+        App-->>User: 重新输入
+    else PIN 正确
+        UAM-->>AAC: 200 OK (Verification Token)
+        AAC-->>App: 返回验证通过 Token (临时凭证)
+    end
+
+    Note over App, CTS: 3. 发起交易 (带上验证凭证)
+    App->>AAC: POST /api/v1/deposit/mobile-money <br/>Header: X-Auth-Token, X-Pin-Token
+    AAC->>DAL: 转发请求
+    DAL->>CTS: 路由至交易系统
+
+    Note over CTS, PG: 4. 交易初始化 & STK Push
+    CTS->>CTS: 校验 X-Pin-Token 有效性
+    CTS->>CTS: 创建订单 (Status: PENDING)
+    CTS->>PG: 调用支付网关 (发起 STK Push)
+    PG-->>CTS: 返回网关受理 ID
+    CTS-->>App: 返回 "处理中，请在手机上输入 M-Pesa PIN"
+
+    Note over User, PG: 5. 运营商侧验证 (双重 PIN)
+    PG->>User: 手机系统弹窗 (USSD Flash) <br/>"Pay TZS 50,000 to Trans-Public? Enter PIN:"
+    User->>PG: 输入 **M-Pesa PIN** (运营商密码)
+
+    Note over PG, ACS: 6. 异步回调与入账
+    PG->>CTS: POST /api/v1/callbacks/payment/notify (Success)
+    CTS->>ACS: POST /internal/account/credit (入账)
+    ACS-->>CTS: 入账成功
+    CTS->>CTS: 更新订单 (COMPLETED)
+        </div>
+    </div>
+
+    <!-- 4. Deposit Flow (Bank Transfer) -->
+    <div class="container">
+        <h2>4. Deposit Flow (Bank Transfer)</h2>
+        <div class="meta-info">
+            <strong>Source:</strong> module_savings_analysis.md<br>
+            <strong>Description:</strong> Offline bank transfer with asynchronous callback notification.
+        </div>
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    actor User as 用户
+    participant App as 前端 App
+    participant AAC as 鉴权中心 (AAC)
+    participant DAL as 聚合层 (DAL)
+    participant CTS as 交易系统 (CTS)
+    participant Bank as 外部银行系统
+    participant ACS as 账户系统 (ACS)
+    participant MSG as 消息中心 (MSG)
+
+    Note over User, App: 1. 获取转账信息
+    User->>App: 点击 "Bank Transfer"
+    App->>AAC: GET /api/v1/dictionaries/payment-channels
+    AAC->>DAL: 获取配置
+    DAL->>CTS: GET /config/channels
+    CTS-->>App: 返回银行账号 (CRDB/NMB)
+
+    Note over App, User: 2. 展示信息
+    App->>User: 展示收款账号、银行名称
+    
+    Note over User, Bank: 3. 线下转账 (App外)
+    User->>Bank: 打开银行App，向指定账号转账<br/>(备注手机号/账号)
+
+    Note over Bank, CTS: 4. 银行回调
+    Bank->>CTS: POST /api/v1/callbacks/bank/notify<br/>{amount, ref, sender}
+    CTS->>CTS: 匹配关联用户
+
+    Note over CTS, ACS: 5. 入账处理
+    CTS->>ACS: POST /internal/account/credit
+    ACS-->>CTS: 入账成功
+    CTS->>CTS: 创建交易流水
+
+    Note over CTS, User: 6. 到账通知
+    CTS->>MSG: 请求发送到账短信
+    MSG->>User: 发送 SMS: "您通过银行转账的 {amount} 已到账"
+        </div>
+    </div>
+
+    <!-- 5. Deposit Flow (Wakala Agent) -->
+    <div class="container">
+        <h2>5. Deposit Flow (Wakala Agent)</h2>
+        <div class="meta-info">
+            <strong>Source:</strong> module_savings_analysis.md<br>
+            <strong>Description:</strong> Offline deposit via Agent using generated Control Number.
+        </div>
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    actor User as 用户
+    participant App as 前端 App
+    participant AAC as 鉴权中心 (AAC)
+    participant DAL as 聚合层 (DAL)
+    participant CTS as 交易系统 (CTS)
+    participant Agent as Wakala代理商
+    participant Aggregator as 支付聚合方
+    participant ACS as 账户系统 (ACS)
+    participant MSG as 消息中心 (MSG)
+
+    Note over User, App: 1. 获取控制码 (Control Number)
+    User->>App: 点击 "Wakala Deposit"
+    App->>AAC: POST /api/v1/deposits/control-number
+    AAC->>DAL: 请求生成
+    DAL->>CTS: POST /trade/deposits/control-number
+    CTS->>CTS: 生成唯一 Control Number (998877)
+    CTS-->>App: 返回 Control Number
+
+    Note over App, User: 2. 展示信息
+    App->>User: 展示 Control Number (有效期24h)
+
+    Note over User, Agent: 3. 线下付款
+    User->>Agent: 前往代理点，提供 Control Number + 现金
+    Agent->>Aggregator: 代理商终端发起充值
+    
+    Note over Aggregator, CTS: 4. 支付回调
+    Aggregator->>CTS: POST /api/v1/callbacks/wakala/notify<br/>{control_number, amount}
+    CTS->>CTS: 校验 Control Number 有效性
+
+    Note over CTS, ACS: 5. 入账处理
+    CTS->>ACS: POST /internal/account/credit
+    ACS-->>CTS: 入账成功
+    CTS->>CTS: 核销 Control Number
+
+    Note over CTS, User: 6. 到账通知
+    CTS->>MSG: 请求发送到账短信
+    MSG->>User: 发送 SMS: "Wakala充值 {amount} 已到账"
+        </div>
+    </div>
+
+    <!-- 6. Transfer Flow (Mobile Money / Bank) -->
+    <div class="container">
+        <h2>6. Transfer Flow (External: Mobile Money / Bank)</h2>
+        <div class="meta-info">
+            <strong>Source:</strong> module_savings_analysis.md<br>
+            <strong>Description:</strong> External transfer via Payment Gateway (Debit transaction).
+        </div>
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    actor User as 用户
+    participant App as 前端 App
+    participant AAC as 鉴权中心 (AAC)
+    participant UAM as 用户中心 (UAM)
+    participant DAL as 聚合层 (DAL)
+    participant CTS as 交易系统 (CTS)
+    participant ACS as 账户系统 (ACS)
+    participant PG as 支付网关 (Mock)
+    participant MSG as 消息中心
+
+    Note over User, App: 1. 发起转账 & 费用预览
+    User->>App: 输入收款人信息 + 金额
+    App->>AAC: POST /api/v1/transfers/preview
+    AAC->>DAL: 转发请求
+    DAL->>CTS: 计算手续费
+    CTS-->>App: 返回总金额 (本金+手续费)
+
+    App->>User: 展示确认页 (含费用明细)
+    User->>App: 确认并输入 App PIN
+
+    Note over App, UAM: 2. 交易鉴权
+    App->>AAC: POST /api/v1/auth/verify-pin
+    AAC->>UAM: 验证 PIN
+    UAM-->>App: 返回 Transaction Token
+
+    Note over App, CTS: 3. 执行转账
+    App->>AAC: POST /api/v1/transfers/execute<br/>(Header: X-Pin-Token)
+    AAC->>DAL: 转发请求
+    DAL->>CTS: 路由至交易系统
+
+    Note over CTS, ACS: 4. 资金冻结
+    CTS->>CTS: 幂等性检查 & 创建订单
+    CTS->>ACS: POST /internal/account/balance/freeze (冻结本金+手续费)
+    ACS-->>CTS: 冻结成功
+
+    Note over CTS, PG: 5. 调用外部网关
+    CTS->>PG: 发起 B2C 转账请求
+    PG-->>CTS: 受理成功 (Pending)
+
+    Note over PG, CTS: 6. 异步回调 & 正式扣款
+    PG->>CTS: 回调通知 (Success)
+    CTS->>ACS: POST /internal/account/posting/entry (正式扣款)
+    ACS-->>CTS: 扣款成功 (Unfreeze + Deduct)
+    
+    CTS->>CTS: 更新订单状态 (COMPLETED)
+    CTS->>MSG: 请求发送转账成功通知
+    MSG->>User: 短信通知: "您向 {name} 转账 {amount} 成功"
+        </div>
+    </div>
+
+    <!-- 7. Transfer Flow (Internal) -->
+    <div class="container">
+        <h2>7. Transfer Flow (Internal Transfer)</h2>
+        <div class="meta-info">
+            <strong>Source:</strong> module_savings_analysis.md<br>
+            <strong>Description:</strong> Real-time internal transfer between bank users.
+        </div>
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    actor User as 用户
+    participant App as 前端 App
+    participant AAC as 鉴权中心 (AAC)
+    participant DAL as 聚合层 (DAL)
+    participant CTS as 交易系统 (CTS)
+    participant ACS as 账户系统 (ACS)
+    participant MSG as 消息中心
+
+    Note over User, App: 1. 收款人反查
+    User->>App: 输入对方账号/手机号 + 金额
+    App->>AAC: POST /api/v1/transfers/recipient-name
+    AAC->>DAL: 查询户名
+    DAL->>ACS: 查询账户信息
+    ACS-->>App: 返回收款人姓名 (Masked: J*** D***)
+
+    App->>User: 确认户名正确
+    User->>App: 输入 PIN 确认
+
+    Note over App, CTS: 2. 执行转账 (带Token)
+    App->>AAC: POST /api/v1/transfers/execute
+    AAC->>DAL: 转发
+    DAL->>CTS: 路由
+
+    Note over CTS, ACS: 3. 原子记账 (Atomic Transfer)
+    CTS->>CTS: 创建订单
+    CTS->>ACS: POST /internal/account/transfer (原子转账)
+    Note right of ACS: 事务开始
+    ACS->>ACS: 检查余额 & 扣减付款人
+    ACS->>ACS: 增加收款人余额
+    Note right of ACS: 事务提交
+    ACS-->>CTS: 转账成功
+
+    CTS->>CTS: 更新订单状态
+    CTS->>MSG: 通知双方
+    MSG->>User: 通知付款人: "转账成功"
+    MSG->>User: 通知收款人: "收到转账 {amount}"
+        </div>
+    </div>
+
+    <!-- 8. Withdrawal Flow (Wakala Agent - Generate Code) -->
+    <div class="container">
+        <h2>8. Withdrawal Flow (Wakala Agent - Generate Code)</h2>
+        <div class="meta-info">
+            <strong>Source:</strong> module_savings_analysis.md<br>
+            <strong>Description:</strong> Generate a one-time withdrawal code for offline cash out.
+        </div>
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    actor User as 用户
+    participant App as 前端 App
+    participant AAC as 鉴权中心
+    participant DAL as 聚合层
+    participant CTS as 交易系统
+    participant ACS as 账户系统
+    participant MSG as 消息中心
+
+    Note over User, App: 1. 申请取现码 & 费用预览
+    User->>App: 选择 Wakala Agent, 输入金额 (50,000)
+    App->>AAC: POST /api/v1/withdrawals/preview (算费)
+    AAC->>DAL: 转发
+    DAL->>CTS: 计算手续费 (如 1,000)
+    CTS-->>App: 返回总扣款 (51,000)
+
+    App->>User: 确认并输入 PIN
+    User->>App: 输入 PIN
+    
+    Note over App, AAC: 2. 交易鉴权
+    App->>AAC: POST /api/v1/auth/verify-pin
+    AAC-->>App: 返回 Transaction Token
+
+    Note over App, CTS: 3. 生成取现码
+    App->>AAC: POST /api/v1/withdrawals/generate-code<br/>(Header: X-Pin-Token)
+    AAC->>DAL: 转发
+    DAL->>CTS: 请求生成
+    
+    CTS->>CTS: 幂等检查 & 生成6位码 (e.g. 123456)
+    CTS->>ACS: POST /internal/account/balance/freeze (冻结 51,000)
+    ACS-->>CTS: 冻结成功
+
+    CTS->>CTS: 保存取现码 (Status: ACTIVE, Expire: +30min)
+    CTS-->>App: 返回取现码 123456
+
+    Note over App, User: 4. 展示
+    App->>User: 展示取现码 & 倒计时
+    CTS->>MSG: 发送短信备忘: "您的取现码是 123456"
+        </div>
+    </div>
+
+    <!-- 9. Withdrawal Flow (Wakala Agent - Redeem Code) -->
+    <div class="container">
+        <h2>9. Withdrawal Flow (Wakala Agent - Redeem Code)</h2>
+        <div class="meta-info">
+            <strong>Source:</strong> module_savings_analysis.md<br>
+            <strong>Description:</strong> Offline redemption of withdrawal code by Agent.
+        </div>
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    actor User as 用户
+    actor Agent as 代理商
+    participant Aggregator as 支付聚合方 (Selcom/Maxcom)
+    participant CTS as 交易系统
+    participant ACS as 账户系统
+    participant MSG as 消息中心
+
+    Note over User, Agent: 1. 线下出示
+    User->>Agent: 提供取现码 (123456) + 手机号
+    
+    Note over Agent, CTS: 2. 代理商发起核销
+    Agent->>Aggregator: 输入码核销 (USSD/POS)
+    Aggregator->>CTS: POST /api/v1/callbacks/wakala/redeem <br/>{code, agentId}
+    
+    CTS->>CTS: 校验码有效性 (存在? 过期? 已用?)
+    CTS->>CTS: 校验关联手机号
+
+    Note over CTS, ACS: 3. 资金结算
+    CTS->>ACS: POST /internal/account/posting/entry (解冻并扣款)
+    ACS-->>CTS: 扣款成功 (User -> Agent/Aggregator)
+    
+    CTS->>CTS: 更新码状态 (USED)
+    CTS->>CTS: 创建交易流水
+
+    CTS-->>Aggregator: 核销成功 + 金额
+    Aggregator-->>Agent: 交易成功提示
+
+    Note over Agent, User: 4. 现金交付
+    Agent->>User: 支付现金 (50,000)
+    CTS->>MSG: 通知用户取现成功: "您已成功取现 {amount}"
+        </div>
+    </div>
+
+    <!-- 10. Saving Plan (Creation) -->
+    <div class="container">
+        <h2>10. Saving Plan Creation (Fixed Deposit)</h2>
+        <div class="meta-info">
+            <strong>Source:</strong> module_savings_analysis.md<br>
+            <strong>Description:</strong> Create a fixed deposit account via CTS.
+        </div>
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    actor User as 用户
+    participant App as 前端 App
+    participant AAC as 鉴权中心
+    participant DAL as 聚合层
+    participant CTS as 交易系统
+    participant ACS as 账户系统
+    participant MSG as 消息中心
+
+    Note over User, App: 1. 选择产品 & 试算
+    User->>App: 选择 "12个月 (11.5%)", 输入 1,000,000
+    App->>AAC: POST /api/v1/savings/preview-creation
+    AAC->>DAL: 转发预览请求
+    DAL->>CTS: POST /internal/trade/savings/preview (Mock)
+    CTS-->>DAL: 返回预览结果 (本金+利息)
+    DAL-->>AAC: 返回预览结果
+    AAC-->>App: 展示预览信息: 到期本息 1,103,500
+
+    App->>User: 确认并输入 PIN
+    
+    Note over App, CTS: 2. 执行开通
+    App->>AAC: POST /api/v1/savings/create
+    AAC->>DAL: 转发创建请求
+    DAL->>CTS: POST /api/v1/deposit/fixed
+    
+    Note right of CTS: 交易核心处理
+    CTS->>ACS: POST /api/v1/account/open (开立定期户)
+    ACS-->>CTS: 返回新账号
+    CTS->>ACS: POST /internal/account/balance/freeze (冻结活期)
+    ACS-->>CTS: 冻结成功
+
+    CTS-->>DAL: 返回创建成功 (AccountNo, ExpiryDate)
+    DAL-->>AAC: 返回成功响应
+    AAC-->>App: 提示创建成功
+
+    CTS->>MSG: 异步发送短信
+        </div>
+    </div>
+
+    <!-- 11. Saving Plan (Redemption) -->
+    <div class="container">
+        <h2>11. Saving Plan Redemption (Early Withdraw)</h2>
+        <div class="meta-info">
+            <strong>Source:</strong> module_savings_analysis.md<br>
+            <strong>Description:</strong> Early redemption with penalty calculation.
+        </div>
+        <div class="mermaid">
+sequenceDiagram
+    autonumber
+    actor User as 用户
+    participant App as 前端 App
+    participant AAC as 鉴权中心
+    participant DAL as 聚合层
+    participant CTS as 交易系统
+    participant ACS as 账户系统
+
+    Note over User, App: 1. 赎回试算 (罚息)
+    User->>App: 点击 "提前赎回"
+    App->>AAC: POST /api/v1/savings/preview-redemption
+    AAC->>DAL: 转发
+    DAL->>CTS: 计算罚息 (扣除50%利息)
+    CTS-->>DAL: 返回预览: 本金 1M + 净利息 20k
+    DAL-->>AAC: 返回预览
+    AAC-->>App: 展示实际到手金额
+
+    App->>User: 确认接受罚息 & 输入 PIN
+
+    Note over App, CTS: 2. 执行赎回
+    App->>AAC: POST /api/v1/savings/redeem
+    AAC->>DAL: 转发
+    DAL->>CTS: 发起赎回
+
+    Note over CTS, ACS: 3. 资金结算
+    CTS->>ACS: POST /internal/account/balance/unfreeze
+    CTS->>ACS: POST /internal/account/posting/entry
+    ACS-->>CTS: 结算完成
+
+    CTS-->>DAL: 返回赎回成功
+    DAL-->>AAC: 返回成功
+    AAC-->>App: 赎回成功
+        </div>
+    </div>
+
+    <!-- Security Deposit (保证金冻结提额) 流程图 -->
+    <div class="sequence-diagram" id="security-deposit-flow">
+        <h3>Security Deposit (保证金冻结提额) 流程</h3>
+        <p class="description">TYPE_C用户通过保证金冻结获得授信额度的完整流程</p>
+        <div class="flow-tags">
+            <span class="tag tag-priority">P0</span>
+            <span class="tag tag-user">TYPE_C</span>
+            <span class="tag tag-module">SV-07</span>
+        </div>
+        <pre class="mermaid">
+sequenceDiagram
+    participant App as 前端App
+    participant AAC as FTISP-AAC
+    participant DAL as FTISP-DAL
+    participant ECIF as FTISP-ECIF
+    participant CTS as FTISP-CTS
+    participant ACS as FTISP-ACS
+    participant DRE as FTISP-DRE
+
+    Note over App: Loans → Limit Management → Security Deposit
+
+    App->>AAC: 输入冻结金额 + 选择期限 + 付款方式
+    AAC->>AAC: 验证JWT Token，提取userId
+
+    AAC->>DAL: POST /api/v1/savings/security-deposit<br/>{amount: 50000, duration: 12,<br/>source: "WALLET"}
+
+    Note over DAL,ECIF: 步骤1: 获取ECIF客户信息
+    DAL->>ECIF: GET /api/v1/internal/ecif/customers/uid/{userId}
+    ECIF->>ECIF: SELECT * FROM t_ecif_customers WHERE user_id=?
+    ECIF->>ECIF: SELECT * FROM t_ecif_bank_mappings WHERE user_id=?
+    ECIF-->>DAL: {userId, phone, customerName, bankMappings: [...]}
+
+    Note over DAL,CTS: 步骤2: 调用CTS创建保证金存款
+    DAL->>CTS: POST /api/v1/deposit/fixed<br/>{ecifNo: "PECIF001",<br/>amount: 50000,<br/>duration: 12,<br/>isSecurityDeposit: true,<br/>maturityInstruction: "AUTO_ROLLOVER"}
+
+    Note over CTS: 幂等检查 + 创建订单 (PENDING)
+
+    Note over CTS,ACS: 步骤3: 冻结资金
+    CTS->>ACS: POST /api/v1/internal/acs/balance/freeze<br/>{accountNo: "ACC001",<br/>amount: 50000,<br/>reason: "SECURITY_DEPOSIT"}
+    ACS->>ACS: UPDATE t_account_balances<br/>frozen_balance += 50000
+    ACS-->>CTS: 冻结成功
+
+    Note over CTS: 步骤4: 创建保证金定期存款记录
+    CTS->>CTS: INSERT t_term_deposits<br/>{is_security_deposit: true,<br/>maturity_instruction: "AUTO_ROLLOVER",<br/>status: "ACTIVE"}
+
+    Note over CTS,DRE: 步骤5: 更新授信额度 (关键)
+    CTS->>DRE: POST /api/v1/internal/credit/limit/increase<br/>{userId: "U001",<br/>amount: 50000,<br/>type: "SECURITY_DEPOSIT"}
+    DRE->>DRE: 更新授信额度<br/>creditLimit += 50000
+    DRE->>DRE: 更新用户类型<br/>TYPE_C → TYPE_C_WITH_CREDIT
+    DRE-->>CTS: 授信额度更新成功
+
+    Note over CTS: 步骤6: 创建交易流水
+    CTS->>CTS: INSERT t_transactions<br/>{category: "SECURITY",<br/>type: "DEBIT"}
+
+    CTS->>CTS: 更新订单状态 (SUCCESS)
+
+    CTS-->>DAL: 返回保证金创建成功<br/>{depositId: "SD001",<br/>oldCreditLimit: 0,<br/>newCreditLimit: 50000,<br/>maturityAmount: 56750}
+
+    DAL-->>AAC: 提额成功
+    AAC-->>App: 显示提额成功动画
+    </pre>
+
+        <div class="flow-steps">
+            <h4>关键步骤说明</h4>
+            <table>
+                <tr>
+                    <th>步骤</th>
+                    <th>操作</th>
+                    <th>关键点</th>
+                </tr>
+                <tr>
+                    <td>1</td>
+                    <td>获取ECIF客户号</td>
+                    <td>DAL调用ECIF获取用户ecif_no</td>
+                </tr>
+                <tr>
+                    <td>2</td>
+                    <td>创建保证金存款</td>
+                    <td>isSecurityDeposit=true, maturityInstruction=AUTO_ROLLOVER</td>
+                </tr>
+                <tr>
+                    <td>3</td>
+                    <td>冻结资金</td>
+                    <td>ACS冻结指定金额到冻结余额</td>
+                </tr>
+                <tr>
+                    <td>4</td>
+                    <td>创建存款记录</td>
+                    <td>CTS创建保证金定期存款记录</td>
+                </tr>
+                <tr>
+                    <td>5</td>
+                    <td>更新授信额度</td>
+                    <td class="highlight">DRE增加授信额度，用户类型升级</td>
+                </tr>
+                <tr>
+                    <td>6</td>
+                    <td>创建交易流水</td>
+                    <td>category=SECURITY记录保证金交易</td>
+                </tr>
+            </table>
+        </div>
+
+        <div class="business-rules">
+            <h4>业务规则</h4>
+            <ul>
+                <li><strong>BR-SV-023</strong>: 1:1额度授予 (冻结多少金额，获得多少授信额度)</li>
+                <li><strong>BR-SV-024</strong>: 保证金赎回限制 (有未结清贷款时禁止赎回)</li>
+                <li><strong>BR-SV-043</strong>: 到期指令锁定 (必须为 AUTO_ROLLOVER，用户不可选择)</li>
+                <li><strong>BR-SV-044</strong>: 用户类型升级 (TYPE_C → TYPE_C_WITH_CREDIT)</li>
+            </ul>
+        </div>
+    </div>
+
+    <!-- Security Deposit 赎回流程图 -->
+    <div class="sequence-diagram" id="security-deposit-redemption-flow">
+        <h3>Security Deposit 赎回流程</h3>
+        <p class="description">保证金赎回时的特殊校验流程（需先还清贷款）</p>
+        <div class="flow-tags">
+            <span class="tag tag-priority">P0</span>
+            <span class="tag tag-user">TYPE_C</span>
+            <span class="tag tag-module">SV-07</span>
+        </div>
+        <pre class="mermaid">
+sequenceDiagram
+    participant App as 前端App
+    participant AAC as FTISP-AAC
+    participant DAL as FTISP-DAL
+    participant CTS as FTISP-CTS
+    participant DRE as FTISP-DRE
+
+    Note over App: 用户尝试赎回保证金定期存款
+
+    App->>AAC: POST /api/v1/savings/redeem<br/>{depositId: "SD001"}
+    AAC->>AAC: 验证JWT Token
+
+    AAC->>DAL: POST /api/v1/savings/redeem<br/>{depositId: "SD001"}
+
+    DAL->>CTS: POST /api/v1/internal/trade/savings/redeem<br/>{depositId: "SD001"}
+
+    Note over CTS: 步骤1: 查询存款信息
+    CTS->>CTS: SELECT * FROM t_term_deposits<br/>WHERE deposit_no = "SD001"
+
+    Note over CTS: 步骤2: 检查是否为保证金存款
+    alt isSecurityDeposit = true
+        Note over CTS: 步骤3: 检查是否有未结清贷款
+        CTS->>DRE: GET /api/v1/internal/credit/loans/active<br/>{userId: "U001"}
+
+        alt 有未结清贷款
+            CTS-->>DAL: 403 REDEEM_BLOCKED<br/>{message: "需先还清所有贷款"}
+            DAL-->>AAC: 403 REDEEM_BLOCKED
+            AAC-->>App: 显示错误提示<br/>"保证金赎回被阻止，需先还清贷款"
+        else 无未结清贷款
+            Note over CTS: 继续正常赎回流程
+            CTS->>CTS: 计算赎回金额(本金+50%利息)
+            CTS->>CTS: 更新存款状态为REDEEMED
+
+            Note over CTS,DRE: 减少授信额度
+            CTS->>DRE: POST /api/v1/internal/credit/limit/decrease<br/>{amount: 50000}
+            DRE->>DRE: creditLimit -= 50000
+            DRE->>DRE: 检查用户类型<br/>TYPE_C_WITH_CREDIT → TYPE_C
+            DRE-->>CTS: 额度更新成功
+
+            CTS-->>DAL: 赎回成功
+            DAL-->>AAC: 赎回成功
+            AAC-->>App: 赎回完成
+        end
+    else isSecurityDeposit = false
+        Note over CTS: 普通定期存款，正常赎回流程
+        CTS->>CTS: 正常赎回处理
+    end
+        </div>
+
+    <!-- 8. 交易历史查询 (SV-08) -->
+    <div class="container">
+        <h2>8. 交易历史查询 (SV-08: Transaction History)</h2>
+        <div class="meta-info">
+            <strong>Source:</strong> module_savings_analysis.md<br>
+            <strong>Description:</strong> 用户查询交易历史，支持按类型筛选、分页加载、下载历史记录。
+        </div>
+        <div class="mermaid">
+sequenceDiagram
+    actor U as 用户
+    participant App as Frontend<br/>(Angular)
+    participant AAC as FTISP-AAC
+    participant DAL as FTISP-DAL
+    participant CTS as FTISP-CTS
+    participant DB as TiDB
+
+    U->>App: 点击Transactions
+    App->>App: 设置filter='ALL', page=0
+    App->>AAC: GET /api/v1/transactions?page=0&size=20<br/>Header: Authorization: Bearer {token}
+
+    AAC->>AAC: 验证JWT Token
+    AAC->>AAC: 提取userId
+
+    AAC->>DAL: GET /api/v1/internal/dal/transactions<br/>?userId={userId}&page=0&size=20
+
+    DAL->>CTS: 查询交易流水
+    CTS->>DB: SELECT * FROM t_transactions<br/>WHERE user_id=?<br/>ORDER BY created_at DESC<br/>LIMIT 20 OFFSET 0
+
+    DB-->>CTS: 交易列表 (20条)
+    CTS-->>DAL: 交易数据
+    DAL-->>AAC: {transactions: [...], totalPages: 5}
+    AAC-->>App: 交易列表响应
+
+    App->>App: 渲染交易列表
+    App->>U: 显示交易历史
+
+    alt 用户筛选SAVINGS
+        U->>App: 点击Savings筛选按钮
+        App->>App: filter='SAVINGS'
+        App->>AAC: GET /api/v1/transactions?category=SAVINGS
+        AAC->>DAL: 查询SAVINGS类型交易
+        DAL-->>AAC: SAVINGS交易列表
+        AAC-->>App: 筛选结果
+        App->>U: 显示仅SAVINGS交易
+    end
+
+    alt 用户查看交易详情
+        U->>App: 点击某条交易
+        App->>App: selectedTx = transaction
+        App->>U: 显示交易详情弹窗
+    end
+
+    alt 用户下载历史
+        U->>App: 点击下载按钮
+        App->>App: isDownloading = true
+        App->>AAC: GET /api/v1/transactions/download
+        AAC->>DAL: 生成交易历史文件
+        DAL->>DAL: 生成PDF/CSV
+        DAL-->>AAC: 文件流
+        AAC-->>App: 文件下载
+        App->>App: isDownloading = false
+        App->>U: 触发浏览器下载
+    end
+
+    alt 用户深度链接
+        App->>App: 检测交易category
+        alt category == SAVINGS
+            App->>U: 显示"View Plan"按钮
+            U->>App: 点击View Plan
+            App->>App: 导航到定期存款详情页
+        end
+        alt category == LOANS
+            App->>U: 显示"View Loan"按钮
+            U->>App: 点击View Loan
+            App->>App: 导航到贷款详情页
+        end
+    end
+        </div>
+    </div>
+
+    <!-- 9. 账户详情查看 (SV-09) -->
+    <div class="container">
+        <h2>9. 账户详情查看 (SV-09: Account Details)</h2>
+        <div class="meta-info">
+            <strong>Source:</strong> module_savings_analysis.md<br>
+            <strong>Description:</strong> 用户查看存款账户的完整信息，包括账号、余额、状态等。
+        </div>
+        <div class="mermaid">
+sequenceDiagram
+    actor U as 用户
+    participant App as Frontend<br/>(Angular)
+    participant AAC as FTISP-AAC
+    participant DAL as FTISP-DAL
+    participant UAM as FTISP-UAM
+    participant ECIF as FTISP-ECIF
+    participant ACS as FTISP-ACS
+
+    U->>App: 点击Details按钮
+    App->>App: showAccountDetails = true
+    App->>AAC: GET /api/v1/accounts/details<br/>Header: Authorization: Bearer {token}
+
+    AAC->>AAC: 验证JWT Token
+    AAC->>AAC: 提取userId
+
+    AAC->>DAL: GET /api/v1/internal/dal/account/details<br/>Header: X-User-Id: {userId}<br/>X-Bank-Code: CYYH
+
+    Note over DAL,UAM: 获取用户信息
+    DAL->>UAM: GET /api/v1/internal/uam/users/{userId}
+    UAM->>UAM: 查询用户信息
+    UAM-->>DAL: {userId, ecifNo, phone, ...}
+
+    Note over DAL,ACS: 查询账户信息
+    DAL->>ACS: 查询账户信息 (ecifNo)
+    ACS->>ACS: SELECT * FROM t_accounts<br/>WHERE ecif_no = ?
+    ACS-->>DAL: {accountNo, accountType, status, ...}
+
+    Note over DAL,ACS: 查询账户余额
+    DAL->>ACS: 查询账户余额
+    ACS->>ACS: SELECT * FROM t_balances<br/>WHERE account_no = ?
+    ACS-->>DAL: {availableBalance, frozenBalance, currentBalance}
+
+    DAL->>DAL: 整合账户数据
+    DAL-->>AAC: AccountDetailsResponse<br/>{accountNo, balance, paybill, ...}
+    AAC-->>App: 账户详情响应
+
+    App->>App: 渲染账户详情弹窗
+    App->>U: 显示账户信息卡片
+
+    alt 用户复制账号
+        U->>App: 点击账号
+        App->>App: navigator.clipboard.writeText(accountNo)
+        App->>U: 显示"账号已复制"提示
+    end
+
+    alt 用户查看Paybill信息
+        U->>App: 点击Paybill
+        App->>U: 显示"Paybill: 888777<br/>Account: {phone}"
+    end
+
+    alt 用户关闭弹窗
+        U->>App: 点击关闭或背景
+        App->>App: showAccountDetails = false
+    end
+        </div>
+    </div>
+
+    <!-- 10. 活跃定期存款管理 (SV-10) -->
+    <div class="container">
+        <h2>10. 活跃定期存款管理 (SV-10: Active Saving Plans Management)</h2>
+        <div class="meta-info">
+            <strong>Source:</strong> module_savings_analysis.md<br>
+            <strong>Description:</strong> 用户查看和管理所有活跃的定期存款，包括查看详情、修改到期指令、提前赎回。
+        </div>
+        <div class="mermaid">
+sequenceDiagram
+    actor U as 用户
+    participant App as Frontend<br/>(Angular)
+    participant AAC as FTISP-AAC
+    participant DAL as FTISP-DAL
+    participant CTS as FTISP-CTS
+    participant DB as TiDB
+
+    U->>App: 点击"Savings Plans"
+    App->>App: handleViewChange('PLANS_DETAIL')
+    App->>AAC: GET /api/v1/savings/plans<br/>Header: Authorization: Bearer {token}
+
+    AAC->>AAC: 验证JWT Token
+    AAC->>AAC: 提取userId
+
+    AAC->>DAL: GET /api/v1/internal/dal/savings/plans<br/>?userId={userId}&status=ACTIVE
+
+    DAL->>CTS: 查询活跃定期存款
+    CTS->>DB: SELECT * FROM t_savings<br/>WHERE user_id=?<br/>AND status='ACTIVE'<br/>ORDER BY created_at DESC
+
+    DB-->>CTS: 活跃存款列表
+    CTS-->>DAL: 定期存款数据
+    DAL-->>AAC: SavingsPlansResponse<br/>{plans: [...], totalValue: ...}
+    AAC-->>App: 定期存款列表
+
+    App->>App: 计算totalPrincipal, totalInterest
+    App->>U: 显示活跃存款列表
+
+    alt 用户查看存款详情
+        U->>App: 点击某条存款
+        App->>App: 显示存款详情卡片
+        App->>U: 显示本金、利率、到期日、<br/>累计收益、到期指令
+    end
+
+    alt 用户修改到期指令
+        U->>App: 点击"Change Maturity Instruction"
+        App->>App: 检查canModifyInstruction
+
+        alt 距离到期日 <= 1天
+            App->>U: 显示"到期前1天不可修改"
+        else isSecurityDeposit = true
+            App->>U: 显示"保证金存款不可修改"
+        else 可以修改
+            App->>U: 显示选项: AUTO_ROLLOVER / CREDIT_TO_ACCOUNT
+            U->>App: 选择新指令
+            App->>AAC: PUT /api/v1/savings/{id}/instruction
+            AAC->>DAL: 更新到期指令
+            DAL->>CTS: UPDATE t_savings<br/>SET maturity_instruction = ?
+            CTS-->>DAL: 更新成功
+            DAL-->>AAC: 更新成功
+            AAC-->>App: 响应成功
+            App->>U: 显示"到期指令已修改"
+        end
+    end
+
+    alt 用户提前赎回
+        U->>App: 点击"Early Withdraw"
+        App->>AAC: POST /api/v1/savings/preview-redemption<br/>{depositId, amount}
+        AAC->>DAL: 预览赎回
+        DAL->>CTS: 计算赎回金额<br/>(本金+利息-罚息)
+        CTS-->>DAL: 预览结果
+        DAL-->>AAC: 预览响应
+        AAC-->>App: 显示赎回预览
+
+        App->>U: 显示赎回金额、罚息、<br/>实际到账
+        U->>App: 确认赎回
+        App->>App: 显示PIN输入框
+        U->>App: 输入PIN
+        App->>AAC: POST /api/v1/savings/redeem<br/>{depositId, PIN}
+
+        AAC->>AAC: 验证PIN
+        AAC->>DAL: 执行赎回
+        DAL->>CTS: 执行提前赎回
+        CTS->>CTS: 计算赎回金额
+        CTS->>CTS: 更新存款状态为REDEEMED
+        CTS->>CTS: 解冻资金
+        CTS->>CTS: 增加钱包余额
+        CTS-->>DAL: 赎回成功
+        DAL-->>AAC: 赎回响应
+        AAC-->>App: 赎回完成
+        App->>U: 显示赎回成功
+    end
+
+    alt 到期自动续存 (后台任务)
+        participant PE as 定时任务
+        PE->>PE: 每日凌晨扫描到期存款
+        PE->>DB: SELECT * FROM t_savings<br/>WHERE maturity_date <= TODAY<br/>AND status='ACTIVE'<br/>AND maturity_instruction='AUTO_ROLLOVER'
+
+        loop 每笔到期存款
+            PE->>PE: 计算到期金额<br/>新本金 = 旧本金 + 税后利息
+            PE->>DB: UPDATE原存款 status='MATURED'
+            PE->>DB: INSERT新定期存款<br/>(status='ACTIVE', 使用当前利率)
+            PE->>DB: INSERT交易流水<br/>(type=SAVINGS_MATURITY_ROLLOVER)
+            PE->>MSG: 发送续存成功通知
+        end
+    end
+        </div>
+    </div>
+
+    <script>
+        mermaid.initialize({ startOnLoad: true, theme: 'default' });
+    </script>
+</body>
+</html>
