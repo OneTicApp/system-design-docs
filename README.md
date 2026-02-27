@@ -6,13 +6,26 @@
 
 ```
 analysis/
-├── README.md                    # 本文件 - 文档入口
-├── user_flow_diagrams.html      # 用户流程图
-└── modules/                     # 模块深度分析
-    ├── module_login_analysis.md      # 登录模块
-    ├── module_kyc_analysis.md        # KYC模块
-    ├── module_credit_analysis.md     # 信贷模块
-    └── module_savings_analysis.md    # 储蓄模块
+├── README.md                         # 本文件 - 文档入口
+├── user_flow_diagrams.html           # 用户流程图
+├── dependency/                       # 外部依赖
+│   └── EXTERNAL_DEPENDENCIES.md      # 依赖说明
+├── modules/                          # 模块深度分析
+│   ├── module_login_analysis.md      # 登录模块
+│   ├── module_kyc_analysis.md        # KYC模块
+│   ├── module_credit_analysis.md     # 信贷模块
+│   └── module_savings_analysis.md    # 储蓄模块
+└── design/                           # 系统设计文档
+    ├── GAP_ANALYSIS_REPORT.md        # 差距分析报告
+    ├── DESIGN_OPTIMIZATION_REPORT.md # 设计优化报告
+    └── subsystems/                   # 子系统设计文档
+        ├── FTISP-AAC-系统设计文档.md
+        ├── FTISP-UAM-系统设计文档.md
+        ├── FTISP-DAL-系统设计文档.md
+        ├── FTISP-KYC-系统设计文档.md
+        ├── FTISP-MSG-系统设计文档.md
+        ├── FTISP-ECIF-系统设计文档.md
+        └── FTISP-ACS-系统设计文档.md
 ```
 
 ## 📦 模块分析
