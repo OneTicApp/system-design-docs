@@ -16,16 +16,11 @@ analysis/
 │   ├── module_credit_analysis.md     # 信贷模块
 │   └── module_savings_analysis.md    # 储蓄模块
 └── design/                           # 系统设计文档
-    ├── GAP_ANALYSIS_REPORT.md        # 差距分析报告
-    ├── DESIGN_OPTIMIZATION_REPORT.md # 设计优化报告
     └── subsystems/                   # 子系统设计文档
-        ├── FTISP-AAC-系统设计文档.md
-        ├── FTISP-UAM-系统设计文档.md
-        ├── FTISP-DAL-系统设计文档.md
-        ├── FTISP-KYC-系统设计文档.md
-        ├── FTISP-MSG-系统设计文档.md
-        ├── FTISP-ECIF-系统设计文档.md
-        └── FTISP-ACS-系统设计文档.md
+        ├── FTISP-AAC-系统设计文档.md  # 统一接入中心
+        ├── FTISP-UAM-系统设计文档.md  # 用户账号管理
+        ├── FTISP-DAL-系统设计文档.md  # 数据访问层
+        └── FTISP-ECIF-系统设计文档.md # ECIF中心
 ```
 
 ## 📦 模块分析
