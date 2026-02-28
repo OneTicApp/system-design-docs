@@ -209,7 +209,7 @@ flowchart TD
 
 | 规则ID | 规则描述 | 实现逻辑 |
 |--------|----------|----------|
-| **BR-KYC-004** | OTP为6位数字 | `@Pattern(regexp = "^\\d{6}$")` |
+| **BR-KYC-004** | OTP为4位数字 | `@Pattern(regexp = "^\\d{4}$")` |
 | **BR-KYC-005** | OTP有效期1分钟 | Redis存储，TTL=60秒 |
 | **BR-KYC-006** | 单日发送限制10次 | Redis计数器，重置时间23:59:59 |
 | **BR-KYC-007** | **发送冷却时间60秒** | **Redis Key `cooldown:otp:phone:TYPE` TTL=60s，防止短信轰炸** |
@@ -335,18 +335,21 @@ flowchart TD
     L -->|重新扫描| A
     L -->|确认| M[点击Continue按钮]
 
-    M --> N[POST /api/v1/kyc/upload-id<br/>同时上传正反两张]
-    N --> O[后端OCR识别]
+    M --> N[POST /api/v1/kyc/submit-profile<br/>提交确认资料和授权]
+    N --> O[后端NIDA验证并保存]
+```
+
+**注意**: OCR识别在两面扫描完成后**自动触发**，无需用户点击Continue。
 ```
 
 #### 2.4.2 关键说明
 
 | 步骤 | 操作 | 是否调用后端 | 说明 |
 |------|------|-------------|------|
-| 扫描正面 | 拍照/选择文件 | ❌ 纯前端 | 暂存到前端变量 |
-| 扫描反面 | 拍照/选择文件 | ❌ 纯前端 | 暂存到前端变量 |
-| 两张都完成 | 显示预览 | ❌ 纯前端 | 让用户确认 |
-| OCR识别 | 后端识别 | ✅ 调用后端 | **仅返回结果给前端，不存储** ⚠️ |
+| 扫描正面 | 调起摄像头拍照 | ❌ 纯前端 | 暂存到前端变量 (base64) |
+| 扫描反面 | 调起摄像头拍照 | ❌ 纯前端 | 暂存到前端变量 (base64) |
+| 两张都完成 | **自动触发OCR** | ✅ **自动调用后端** | 调用OCR识别接口 |
+| OCR识别完成 | 显示识别结果 | - | **自动**显示OCR结果供用户确认 |
 | 用户编辑信息 | 前端操作 | ❌ 纯前端 | 用户可修改OCR结果 |
 | 用户点击Continue | 提交确认信息 | ✅ **此时才存储** | 一起保存：OCR记录+确认信息+授权 ⚠️ |
 
@@ -2356,7 +2359,7 @@ authentication: Bearer Token
 > **说明**: 身份证扫描（拍照/选图）是纯前端操作，不涉及后端
 > **路由**: Frontend → DAL → KYC → OSS (存储图片)
 
-**接口**: `POST /api/v1/kyc/upload-id`
+**接口**: `POST /api/v1/kyc/upload-documents`
 
 **请求**:
 ```yaml
@@ -2756,7 +2759,7 @@ requestBody:
     request_time: string    # 请求时间戳 (yyyy-MM-dd HH:mm:ss) - 必填
   body:
     user_id: string         # 用户ID - 必填
-    bank_code?: string      # 银行编码 (默认CYYH) - 可选
+    bank_code?: string      # 银行编码 (默认CRDB) - 可选
     ecif_no: string         # ECIF客户号 - 必填
     account_type?: string   # 账户类型 (默认SAVINGS) - 可选
     account_class?: integer # 账户类别 (1-I类 2-II类 3-III类) - 可选
@@ -2776,7 +2779,7 @@ requestBody:
   },
   "body": {
     "user_id": "U202401010001",
-    "bank_code": "CYYH",
+    "bank_code": "CRDB",
     "ecif_no": "ECIF202401010001",
     "account_type": "SAVINGS",
     "account_class": 1,
@@ -2823,7 +2826,7 @@ requestBody:
   "body": {
     "account_id": 1001,
     "account_no": "6225887766554433",
-    "bank_code": "CYYH",
+    "bank_code": "CRDB",
     "account_status": 1,
     "account_status_desc": "正常",
     "core_account_seq": "CORE202401010001",
@@ -2898,7 +2901,7 @@ requestBody:
   },
   "body": {
     "user_id": "U202401010001",
-    "bank_code": "CYYH",
+    "bank_code": "CRDB",
     "ecif_no": "ECIF202401010001"
   }
 }
@@ -3037,7 +3040,7 @@ requestBody:
     request_time: string    # 请求时间戳 (yyyy-MM-dd HH:mm:ss) - 必填
   body:
     user_id: string         # 用户ID - 必填
-    bank_code?: string      # 银行编码 (默认CYYH) - 可选
+    bank_code?: string      # 银行编码 (默认CRDB) - 可选
     ecif_no: string         # ECIF客户号 - 必填
     account_type: string    # 账户类型 (LOAN) - 必填
     credit_limit: number    # 授信额度 - 必填
@@ -3067,7 +3070,7 @@ requestBody:
     request_time: string    # 请求时间戳 (yyyy-MM-dd HH:mm:ss) - 必填
   body:
     user_id: string         # 用户ID - 必填
-    bank_code?: string      # 银行编码 (默认CYYH) - 可选
+    bank_code?: string      # 银行编码 (默认CRDB) - 可选
     ecif_no: string         # ECIF客户号 - 必填
     account_type: string    # 账户类型 (LOAN) - 必填
     credit_limit: number    # 授信额度 - 必填
@@ -3087,7 +3090,7 @@ requestBody:
   },
   "body": {
     "user_id": "U202401010001",
-    "bank_code": "CYYH",
+    "bank_code": "CRDB",
     "ecif_no": "ECIF202401010001",
     "account_type": "LOAN",
     "credit_limit": 50000.00,
@@ -3136,7 +3139,7 @@ requestBody:
   "body": {
     "account_id": 1002,
     "account_no": "6225887766554444",
-    "bank_code": "CYYH",
+    "bank_code": "CRDB",
     "account_status": 1,
     "account_status_desc": "正常",
     "core_account_seq": "CORE202401010002",
@@ -3190,7 +3193,7 @@ requestBody:
   },
   "body": {
     "user_id": "U202401010001",
-    "bank_code": "CYYH"
+    "bank_code": "CRDB"
   }
 }
 ```
@@ -3243,7 +3246,7 @@ requestBody:
       {
         "account_id": 1001,
         "user_id": "U202401010001",
-        "bank_code": "CYYH",
+        "bank_code": "CRDB",
         "ecif_no": "ECIF202401010001",
         "account_no": "6225887766554433",
         "account_status": 1,
@@ -3260,7 +3263,7 @@ requestBody:
       {
         "account_id": 1002,
         "user_id": "U202401010001",
-        "bank_code": "CYYH",
+        "bank_code": "CRDB",
         "ecif_no": "ECIF202401010001",
         "account_no": "6225887766554444",
         "account_status": 1,

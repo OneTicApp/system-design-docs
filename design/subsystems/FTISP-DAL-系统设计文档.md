@@ -97,7 +97,9 @@ graph TD
 
 | 方法 | 路径 | 描述 | 调用方 |
 |------|------|------|--------|
+| POST | `/api/v1/kyc/upload-documents` | OCR识别身份证 | AAC |
 | POST | `/api/v1/registration/kyc/submit-profile` | 提交用户资料 | AAC |
+| POST | `/api/v1/kyc/biometric-verify` | 生物识别验证 | AAC |
 | POST | `/api/v1/kyc/submit` | 提交KYC申请 | AAC |
 | GET | `/api/v1/kyc/application-status` | 查询审核进度 | AAC |
 | POST | `/api/v1/deposits/initiate` | 发起充值(入金) | AAC |
@@ -108,6 +110,75 @@ graph TD
 | POST | `/internal/dal/risk-callback` | 风控回调 | 风控系统 |
 
 ### 3.2 接口详情
+
+#### 3.2.0 OCR识别身份证接口
+
+**接口**: `POST /api/v1/kyc/upload-documents`
+
+> **说明**: 前端调用摄像头拍摄身份证正反面后，自动调用此接口进行OCR识别
+> **路由**: AAC → DAL → KYC → 第三方OCR服务
+> **调用时机**: 身份证正反面都拍摄完成后自动触发
+
+**Request (Java Record)**:
+```java
+@Schema(description = "OCR识别请求")
+public record UploadDocumentsRequest(
+    @Schema(description = "用户ID", example = "123")
+    @NotNull
+    String userId,
+
+    @Schema(description = "正面照片Base64")
+    @NotNull
+    @Size(min = 1, max = 5 * 1024 * 1024)
+    String frontImagePath,
+
+    @Schema(description = "反面照片Base64")
+    @NotNull
+    @Size(min = 1, max = 5 * 1024 * 1024)
+    String backImagePath
+) {}
+```
+
+**Response (Java Record)**:
+```java
+@Schema(description = "OCR识别响应")
+public record UploadDocumentsResponse(
+    @Schema(description = "是否成功")
+    Boolean success,
+
+    @Schema(description = "OCR识别结果")
+    OcrResultData data,
+
+    @Schema(description = "错误消息")
+    String message
+) {}
+
+@Schema(description = "OCR识别结果")
+public record OcrResultData(
+    @Schema(description = "姓名")
+    String fullName,
+
+    @Schema(description = "身份证号")
+    String idNumber,
+
+    @Schema(description = "出生日期")
+    String dob,
+
+    @Schema(description = "性别")
+    String gender,
+
+    @Schema(description = "地址")
+    String address
+) {}
+```
+
+**业务规则**:
+- 两张图片必须同时提供
+- 图片大小不超过5MB
+- OCR识别结果供用户确认，用户可编辑
+- 识别失败时可降级到手动输入
+
+---
 
 #### 3.2.1 提交用户资料接口
 
@@ -528,7 +599,7 @@ public class SecurityDepositService {
             .sourceSystem("FTISP-DAL")
             .requestTime(getCurrentTimestamp())
             .userId(userId.toString())
-            .bankCode("CYYH")
+            .bankCode("CRDB")
             .ecifNo(customer.customerNo())
             .productId(null)  // 保证金产品无需指定
             .amount(new BigDecimal(request.amount()))
@@ -1712,15 +1783,94 @@ sequenceDiagram
 @Service
 @RequiredArgsConstructor
 public class SavingsService {
-    
+
     private final CtsClient ctsClient;
-    
+
     public CreateSavingsResponse createPlan(CreateSavingsPlanRequest request) {
         // DAL 仅负责透传请求，不再处理 Saga 逻辑
         return ctsClient.createSavingsTrade(request);
     }
 }
 ```
+
+### 6.3.5 KYC资料提交流程 (Profile Submission Flow)
+
+> **场景**: 用户完成OCR识别后，提交个人资料和授权协议，DAL编排UAM保存资料并调用KYC进行NIDA验证。
+> **业务规则**: 必须先保存用户资料和授权记录，再进行NIDA验证，验证通过后更新用户状态。
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant AAC as AAC
+    participant DAL as DAL
+    participant UAM as UAM
+    participant KYC as KYC
+    participant DB as TiDB
+
+    U->>AAC: POST /api/v1/registration/kyc/submit-profile
+    Note over AAC: 验证JWT Token，提取userId
+
+    AAC->>DAL: POST /api/v1/registration/kyc/submit-profile
+    Note over DAL: userId, profileData(idNumber, fullName, dob, consents)
+
+    Note over DAL,UAM: 步骤1: 保存用户资料
+    DAL->>UAM: POST /api/v1/internal/uam/users/{userId}/profile
+    Note over UAM: 验证用户存在
+    UAM->>DB: INSERT/UPDATE t_user_profiles
+    UAM-->>DAL: 200 OK + profileId
+
+    alt 保存资料成功
+        Note over DAL,UAM: 步骤2: 保存授权记录
+        DAL->>UAM: POST /api/v1/internal/uam/consents
+        Note over UAM: 验证用户存在
+        UAM->>DB: INSERT t_user_consents (多条)
+        UAM-->>DAL: 200 OK
+
+        Note over DAL,KYC: 步骤3: NIDA联网验证
+        DAL->>KYC: POST /api/v1/internal/kyc/verify-nida
+        Note over KYC: 调用NIDA系统验证身份
+        KYC-->>DAL: 200 OK + verified=true/false
+
+        alt NIDA验证通过
+            Note over DAL,UAM: 步骤4: 更新用户状态为已验证
+            DAL->>UAM: PUT /api/v1/internal/uam/users/{userId}/status
+            Note over UAM: 更新kycStatus=VERIFIED
+            UAM->>DB: UPDATE t_users SET kyc_status='VERIFIED'
+            UAM->>DB: UPDATE t_user_profiles SET nida_verified=true
+            UAM-->>DAL: 200 OK
+
+            DAL-->>AAC: 200 OK + nidaVerified=true
+            AAC-->>U: KYC资料提交成功，NIDA已验证
+        else NIDA验证失败
+            DAL-->>AAC: 200 OK + nidaVerified=false
+            AAC-->>U: KYC资料提交成功，NIDA验证失败
+        end
+    else 保存资料失败
+        UAM-->>DAL: 404/500 用户不存在
+        DAL-->>AAC: 400 保存失败
+        AAC-->>U: 保存用户资料失败
+    end
+```
+
+**接口说明**:
+
+| 接口 | 方法 | 调用方 | 说明 |
+|------|------|--------|------|
+| `/api/v1/registration/kyc/submit-profile` | POST | AAC | 提交KYC资料入口 |
+| `/api/v1/internal/uam/users/{id}/profile` | POST | DAL | 保存用户资料到UAM |
+| `/api/v1/internal/uam/consents` | POST | DAL | 保存授权记录到UAM |
+| `/api/v1/internal/uam/users/{id}/status` | PUT | DAL | 更新用户KYC状态 |
+| `/api/v1/internal/kyc/verify-nida` | POST | DAL | NIDA联网验证 |
+
+**状态流转**:
+
+```
+NOT_STARTED → IN_PROGRESS(资料提交) → VERIFIED(NIDA通过) → APPROVED(风控通过)
+                                                    ↓
+                                               REJECTED(风控拒绝)
+```
+
+---
 
 ### 6.4 定期存款赎回流程 (Redemption Flow)
 

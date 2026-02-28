@@ -102,15 +102,15 @@ graph TD
 |------|------|------|--------|
 | POST | `/api/v1/internal/uam/send-otp` | 发送OTP | AAC |
 | POST | `/api/v1/internal/uam/verify-otp` | 验证OTP | AAC |
-| POST | `/api/v1/internal/uam/validate-pin` | 验证PIN | AAC |
+| POST | `/api/v1/internal/uam/validate-pin` | 验证PIN (手机号+PIN) | AAC |
 | POST | `/api/v1/internal/uam/create-session` | 创建会话 | AAC |
 | POST | `/api/v1/internal/uam/refresh-token` | 刷新Token | AAC |
 | POST | `/api/v1/internal/uam/initiate-pin-reset` | 发起PIN重置(发送OTP) | AAC |
 | POST | `/api/v1/internal/uam/verify-reset-otp` | 验证重置OTP | AAC |
 | POST | `/api/v1/internal/uam/reset-pin` | 重置PIN | AAC |
-| POST | `/api/v1/internal/uam/change-pin` | 修改PIN | AAC |
+| POST | `/api/v1/internal/uam/set-pin` | 设置PIN (用户ID+PIN) | AAC |
+| POST | `/api/v1/internal/uam/verify-pin` | 验证PIN (用户ID+PIN，交易前验证) | AAC |
 | GET | `/api/v1/internal/uam/users/{id}` | 获取用户信息 | AAC |
-| PUT | `/api/v1/internal/uam/users/{id}/pin` | 首次设置PIN | AAC |
 | GET | `/api/v1/internal/uam/users/{id}/sessions` | 获取用户会话 | AAC |
 | DELETE | `/api/v1/internal/uam/sessions/{id}` | 注销会话 | AAC |
 | POST | `/api/v1/internal/uam/consents` | 保存授权记录 | DAL |
@@ -630,6 +630,7 @@ public record ResetPinResponse(
 #### 3.2.13 修改PIN接口
 
 > **说明**: 用户已知当前PIN，主动修改PIN
+> **状态**: ⏳ 未实现 (当前版本暂不支持)
 
 **接口**: `POST /api/v1/internal/uam/change-pin`
 
@@ -708,6 +709,103 @@ public record PinHistoryResponse(
     Instant createdAt
 ) {}
 ```
+
+---
+
+#### 3.2.15 设置PIN接口
+
+> **说明**: 用户设置6位PIN码（新用户首次设置或用户主动设置）
+
+**接口**: `POST /api/v1/internal/uam/set-pin`
+
+**Request (Java Record)**:
+```java
+@Schema(description = "设置PIN请求")
+public record SetPinRequest(
+    @Schema(description = "用户ID")
+    @NotNull(message = "用户ID不能为空")
+    Long userId,
+
+    @Schema(description = "PIN码（6位数字）", example = "123456")
+    @NotBlank(message = "PIN码不能为空")
+    @Pattern(regexp = "^\\d{6}$", message = "PIN必须是6位数字")
+    String pin
+) {}
+```
+
+**Response**:
+```java
+@Schema(description = "设置PIN响应")
+public record SetPinResponse(
+    @Schema(description = "是否成功")
+    boolean success,
+
+    @Schema(description = "提示消息")
+    String message
+) {}
+```
+
+**错误码**:
+| 错误码 | 说明 |
+|--------|------|
+| USER_NOT_FOUND | 用户不存在 |
+| INVALID_PIN_FORMAT | PIN格式错误 |
+| PIN_ALREADY_SET | 用户已设置PIN |
+
+**实现说明**:
+- 使用BCrypt哈希PIN后存储到`t_users.pin_hash`
+- 更新`t_users.pin_updated_at`为当前时间
+- 记录PIN历史到`t_pin_history`
+
+---
+
+#### 3.2.16 验证PIN接口
+
+> **说明**: 验证PIN码（用于交易前验证，生成验证令牌）
+
+**接口**: `POST /api/v1/internal/uam/verify-pin`
+
+**Request (Java Record)**:
+```java
+@Schema(description = "验证PIN请求")
+public record VerifyPinRequest(
+    @Schema(description = "用户ID")
+    @NotNull(message = "用户ID不能为空")
+    Long userId,
+
+    @Schema(description = "PIN码（6位数字）", example = "123456")
+    @NotBlank(message = "PIN码不能为空")
+    @Pattern(regexp = "^\\d{6}$", message = "PIN必须是6位数字")
+    String pin
+) {}
+```
+
+**Response**:
+```java
+@Schema(description = "验证PIN响应")
+public record VerifyPinResponse(
+    @Schema(description = "是否成功")
+    boolean success,
+
+    @Schema(description = "提示消息")
+    String message,
+
+    @Schema(description = "验证令牌（用于后续交易）")
+    String verificationToken
+) {}
+```
+
+**错误码**:
+| 错误码 | 说明 |
+|--------|------|
+| USER_NOT_FOUND | 用户不存在 |
+| INVALID_PIN | PIN错误 |
+| PIN_NOT_SET | 用户未设置PIN |
+
+**实现说明**:
+- 使用BCrypt验证PIN
+- 验证成功生成UUID作为`verificationToken`
+- 验证失败返回401状态码
 
 ---
 
@@ -1698,8 +1796,8 @@ sequenceDiagram
         UAM-->>AAC: 429 Too Many Requests
         AAC-->>C: 请等待X秒后再试
     else 可以发送
-        Note over UAM: 生成6位OTP
-        UAM->>UAM: otp = RandomUtil.generate(6)
+        Note over UAM: 生成4位OTP
+        UAM->>UAM: otp = RandomUtil.generate(4)
 
         Note over UAM: 双写：Redis + DB
         UAM->>R: SET otp:phone:LOGIN {otp} TTL=60s

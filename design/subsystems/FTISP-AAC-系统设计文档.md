@@ -100,6 +100,14 @@ graph TD
 | POST | `/api/v1/auth/send-reset-otp` | 发送重置验证码 | None |
 | POST | `/api/v1/auth/verify-reset-otp` | 验证重置验证码 | None |
 | POST | `/api/v1/auth/reset-pin` | 重置 PIN | None |
+| POST | `/api/v1/auth/set-pin` | 设置PIN | Bearer |
+| POST | `/api/v1/auth/verify-pin` | 验证PIN | Bearer |
+| | | | |
+| POST | `/api/v1/kyc/upload-documents` | OCR识别身份证 | Bearer |
+| POST | `/api/v1/registration/kyc/submit-profile` | 提交KYC资料 | Bearer |
+| POST | `/api/v1/kyc/biometric-verify` | 生物识别验证 | Bearer |
+| POST | `/api/v1/kyc/submit` | 提交KYC申请 | Bearer |
+| GET | `/api/v1/kyc/application-status` | 查询KYC审核状态 | Bearer |
 
 ### 3.3 忘记PIN流程 (Forgot PIN Flow)
 
@@ -586,6 +594,340 @@ public record Profile(
     String fullName,
     LocalDate dateOfBirth,
     String address
+) {}
+```
+
+---
+
+#### 3.2.6 OCR识别身份证接口
+
+**接口**: `POST /api/v1/kyc/upload-documents`
+
+> **说明**: 前端调用摄像头拍摄身份证正反面后，自动调用此接口进行OCR识别
+
+**路由**: Frontend → AAC → DAL → KYC
+
+**Request (Java Record)**:
+```java
+@Schema(description = "OCR识别请求")
+public record UploadDocumentsRequest(
+    @Schema(description = "用户ID", example = "123")
+    @NotNull
+    String userId,
+
+    @Schema(description = "正面照片Base64", example = "data:image/jpeg;base64,/9j/4AAQ...")
+    @NotNull
+    @Size(min = 1, max = 5 * 1024 * 1024)  // 最大5MB
+    String frontImagePath,
+
+    @Schema(description = "反面照片Base64", example = "data:image/jpeg;base64,/9j/4AAQ...")
+    @Size(min = 1, max = 5 * 1024 * 1024)
+    String backImagePath
+) {}
+```
+
+**Response (Java Record)**:
+```java
+@Schema(description = "OCR识别响应")
+public record UploadDocumentsResponse(
+    @Schema(description = "是否成功")
+    Boolean success,
+
+    @Schema(description = "OCR识别结果")
+    OcrResult data,
+
+    @Schema(description = "错误消息")
+    String message
+) {}
+
+@Schema(description = "OCR识别结果")
+public record OcrResult(
+    @Schema(description = "姓名", example = "JUMA HAMISI JUMA")
+    String fullName,
+
+    @Schema(description = "身份证号", example = "19900101-12345-12345-01")
+    String idNumber,
+
+    @Schema(description = "出生日期", example = "1990-01-01")
+    String dob,
+
+    @Schema(description = "性别", example = "M")
+    String gender,
+
+    @Schema(description = "地址")
+    String address
+) {}
+```
+
+---
+
+#### 3.2.7 提交KYC资料接口
+
+**接口**: `POST /api/v1/registration/kyc/submit-profile`
+
+> **说明**: 用户确认OCR结果并勾选授权协议后点击Continue调用
+
+**路由**: Frontend → AAC → DAL → UAM/KYC
+
+**Request (Java Record)**:
+```java
+@Schema(description = "提交KYC资料请求")
+public record SubmitProfileRequest(
+    @Schema(description = "用户ID", example = "123")
+    @NotNull
+    String userId,
+
+    @Schema(description = "KYC资料数据")
+    @NotNull
+    ProfileData profileData
+) {}
+
+@Schema(description = "KYC资料数据")
+public record ProfileData(
+    @Schema(description = "姓名", example = "JUMA HAMISI JUMA")
+    String fullName,
+
+    @Schema(description = "身份证号", example = "19900101-12345-12345-01")
+    String idNumber,
+
+    @Schema(description = "出生日期", example = "1990-01-01")
+    String dob,
+
+    @Schema(description = "性别")
+    String gender,
+
+    @Schema(description = "地址")
+    String address,
+
+    @Schema(description = "身份证正面照片Base64")
+    String idCardFrontImage,
+
+    @Schema(description = "身份证反面照片Base64")
+    String idCardBackImage,
+
+    @Schema(description = "位置权限已授予")
+    Boolean locationPermissionGranted,
+
+    @Schema(description = "征信局授权")
+    @NotNull
+    Boolean creditBureauConsent,
+
+    @Schema(description = "储蓄账户协议授权")
+    @NotNull
+    Boolean savingsAgreementConsent
+) {}
+```
+
+**Response (Java Record)**:
+```java
+@Schema(description = "提交KYC资料响应")
+public record SubmitProfileResponse(
+    @Schema(description = "是否成功")
+    Boolean success,
+
+    @Schema(description = "消息")
+    String message,
+
+    @Schema(description = "NIDA是否验证通过")
+    Boolean nidaVerified,
+
+    @Schema(description = "KYC状态")
+    String status
+) {}
+```
+
+---
+
+#### 3.2.8 生物识别验证接口
+
+**接口**: `POST /api/v1/kyc/biometric-verify`
+
+> **说明**: 活体检测和人脸比对（前端模拟）
+
+**路由**: Frontend → AAC → DAL → KYC
+
+**Request (Java Record)**:
+```java
+@Schema(description = "生物识别验证请求")
+public record BiometricVerifyRequest(
+    @Schema(description = "用户ID", example = "123")
+    @NotNull
+    String userId,
+
+    @Schema(description = "自拍照片Base64")
+    @NotNull
+    String selfieImagePath,
+
+    @Schema(description = "身份证照片Base64（用于人脸比对）")
+    String idCardImagePath
+) {}
+```
+
+**Response (Java Record)**:
+```java
+@Schema(description = "生物识别验证响应")
+public record BiometricVerifyResponse(
+    @Schema(description = "是否成功")
+    Boolean success,
+
+    @Schema(description = "消息")
+    String message,
+
+    @Schema(description = "活体检测通过")
+    Boolean data,
+
+    @Schema(description = "活体检测通过")
+    Boolean livenessPassed,
+
+    @Schema(description = "人脸匹配通过")
+    Boolean faceMatched,
+
+    @Schema(description = "匹配置信度")
+    Double matchScore
+) {}
+```
+
+---
+
+#### 3.2.9 提交KYC申请接口
+
+**接口**: `POST /api/v1/kyc/submit`
+
+> **说明**: 提交KYC申请到风控审核
+
+**路由**: Frontend → AAC → DAL → 风控系统
+
+**Request (Java Record)**:
+```java
+@Schema(description = "提交KYC申请请求")
+public record SubmitKycRequest(
+    @Schema(description = "用户ID", example = "123")
+    @NotNull
+    String userId,
+
+    @Schema(description = "申请数据（可选）")
+    Map<String, Object> applicationData
+) {}
+```
+
+**Response (Java Record)**:
+```java
+@Schema(description = "提交KYC申请响应")
+public record SubmitKycResponse(
+    @Schema(description = "是否成功")
+    Boolean success,
+
+    @Schema(description = "消息")
+    String message,
+
+    @Schema(description = "申请ID")
+    String applicationId,
+
+    @Schema(description = "状态", example = "PENDING")
+    String status
+) {}
+```
+
+---
+
+#### 3.2.10 查询KYC审核状态接口
+
+**接口**: `GET /api/v1/kyc/application-status`
+
+> **说明**: 查询KYC申请的审核状态
+
+**路由**: Frontend → AAC → DAL → KYC
+
+**Request Parameters**:
+```java
+@Schema(description = "查询参数")
+public record ApplicationStatusRequest(
+    @Schema(description = "用户ID", example = "123")
+    @NotNull
+    String userId
+) {}
+```
+
+**Response (Java Record)**:
+```java
+@Schema(description = "KYC审核状态响应")
+public record ApplicationStatusResponse(
+    @Schema(description = "状态", example = "PENDING")
+    String status,
+
+    @Schema(description = "提交时间")
+    Instant submittedAt,
+
+    @Schema(description = "审核时间")
+    Instant reviewedAt,
+
+    @Schema(description = "拒绝原因")
+    String rejectionReason
+) {}
+```
+
+---
+
+#### 3.2.11 设置PIN接口
+
+**接口**: `POST /api/v1/auth/set-pin`
+
+> **说明**: 用户设置6位PIN码
+
+**Request (Java Record)**:
+```java
+@Schema(description = "设置PIN请求")
+public record SetPinRequest(
+    @Schema(description = "PIN码（6位数字）", example = "123456")
+    @NotNull
+    @Pattern(regexp = "^\\d{6}$")
+    String pin
+) {}
+```
+
+**Response (Java Record)**:
+```java
+@Schema(description = "设置PIN响应")
+public record SetPinResponse(
+    @Schema(description = "是否成功")
+    Boolean success,
+
+    @Schema(description = "消息")
+    String message
+) {}
+```
+
+---
+
+#### 3.2.12 验证PIN接口
+
+**接口**: `POST /api/v1/auth/verify-pin`
+
+> **说明**: 验证PIN码（用于交易前验证）
+
+**Request (Java Record)**:
+```java
+@Schema(description = "验证PIN请求")
+public record VerifyPinRequest(
+    @Schema(description = "PIN码（6位数字）", example = "123456")
+    @NotNull
+    @Pattern(regexp = "^\\d{6}$")
+    String pin
+) {}
+```
+
+**Response (Java Record)**:
+```java
+@Schema(description = "验证PIN响应")
+public record VerifyPinResponse(
+    @Schema(description = "是否成功")
+    Boolean success,
+
+    @Schema(description = "验证令牌，用于后续交易")
+    String verificationToken,
+
+    @Schema(description = "消息")
+    String message
 ) {}
 ```
 

@@ -87,12 +87,12 @@ sequenceDiagram
     Note over UAM,Redis: 检查冷却时间（防刷）
     UAM->>Redis: GET cooldown:otp:phone:REGISTER
 
-    alt 冷却中（60秒内）
+    alt 冷却中（60秒内重复发送）
         UAM-->>AAC: 429 Too Many Requests
         AAC-->>F: 请等待X秒后再试
     else 可以发送
         Note over UAM: UAM生成OTP (Redis+DB双写)
-        UAM->>UAM: 生成6位随机码
+        UAM->>UAM: 生成4位随机码
         UAM->>Redis: SET otp:phone:REGISTER {otp} TTL=60s
         UAM->>Redis: SET cooldown:otp:phone:REGISTER "1" TTL=60s
         UAM->>DB: INSERT t_otp_records(phone, otp_plain, status=PENDING)
@@ -157,16 +157,19 @@ sequenceDiagram
         end
     end
 
-    Note over U,F: 第二阶段：身份证扫描 (纯前端操作)
+    Note over U,F: 第二阶段：身份证扫描 (摄像头+OCR)
 
-    U->>F: 扫描/选择身份证正面
+    U->>F: 点击扫描身份证正面
+    F->>F: 调起摄像头
+    U->>F: 拍摄正面
     F->>F: 暂存frontImage
-    U->>F: 扫描/选择身份证反面
+
+    U->>F: 点击扫描身份证反面
+    F->>F: 调起摄像头
+    U->>F: 拍摄反面
     F->>F: 暂存backImage
-    U->>F: 点击Continue按钮
 
-    Note over U,DAL: 第三阶段：KYC信息收集 (DAL编排)
-
+    Note over F: 扫描完成，自动调用OCR
     F->>AAC: POST /api/v1/kyc/upload-documents
     AAC->>DAL: 路由到编排中心
 
@@ -178,11 +181,14 @@ sequenceDiagram
     KYC->>KYC: OCR识别
     KYC->>DB: INSERT t_kyc_documents
     KYC-->>DAL: 返回OCR结果
-    DAL-->>F: 返回OCR数据
+    DAL-->>F: 返回OCR数据 (fullName, idNumber, dob)
 
-    Note over U,F: 用户确认并提交
+    Note over U,F: 第三阶段：确认信息+勾选授权
 
-    U->>F: 确认信息+勾选授权
+    F->>U: 展示OCR识别结果供用户确认
+    U->>F: 确认信息无误+勾选授权协议
+    U->>F: 点击Continue按钮
+
     F->>AAC: POST /api/v1/kyc/submit-profile
     AAC->>DAL: 路由到编排中心
 
@@ -1040,7 +1046,7 @@ sequenceDiagram
     AAC->>AAC: 验证JWT Token
     AAC->>AAC: 提取userId
 
-    AAC->>DAL: GET /api/v1/internal/dal/account/details<br/>Header: X-User-Id: {userId}<br/>X-Bank-Code: CYYH
+    AAC->>DAL: GET /api/v1/internal/dal/account/details<br/>Header: X-User-Id: {userId}<br/>X-Bank-Code: CRDB
 
     Note over DAL,UAM: 获取用户信息
     DAL->>UAM: GET /api/v1/internal/uam/users/{userId}
